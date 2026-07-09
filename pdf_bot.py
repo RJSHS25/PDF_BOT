@@ -1,21 +1,3 @@
-"""
-GurucoolBOT — Local Document Q&A Chatbot
------------------------------------------
-No API calls, no external LLM. Pure TF-IDF retrieval with sklearn.
-Reads both PDF (.pdf) and Word (.docx) files.
-
-Folder layout expected (all relative to this .py file):
-
-    your_project/
-    ├── pdf_chatbot.py
-    ├── documents/              <- put your .pdf and .docx files here
-    └── processed_data.json     <- auto-created cache (do not edit)
-
-Run with:  streamlit run pdf_chatbot.py
-
-Dependencies:  pip install streamlit pymupdf python-docx scikit-learn
-"""
-
 import os
 import re
 import json
