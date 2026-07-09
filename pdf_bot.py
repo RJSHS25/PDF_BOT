@@ -1,7 +1,9 @@
 import os
 import re
+import csv
 import json
 import hashlib
+from datetime import datetime
 
 import fitz  # PyMuPDF
 import streamlit as st
@@ -17,6 +19,7 @@ BOT_NAME = "GurucoolBOT"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DOCS_DIR = os.path.join(BASE_DIR, "documents")
 CACHE_FILE = os.path.join(BASE_DIR, "processed_data.json")
+QA_LOG_FILE = os.path.join(BASE_DIR, "qa_log.csv")  # every question+answer gets appended here
 
 MIN_PARA_LEN = 40          # ignore tiny fragments (page numbers, headers)
 TOP_CHUNKS = 8              # how many chunks to consider before sentence-ranking
@@ -371,6 +374,56 @@ def get_top_matches(chunks, question, top_n=TOP_MATCHES):
 
 
 # ------------------------------------------------------------------
+# 4b. Conversational summary — still 100% extractive (no LLM), just
+# stitched into flowing prose instead of a bare list of quotes.
+# ------------------------------------------------------------------
+FOLLOWUP_CONNECTORS = [
+    "I also found this in",
+    "Additionally,",
+    "It's also worth noting from",
+]
+
+
+def build_conversational_summary(matches, metadata_):
+    if not matches:
+        return None
+
+    lead_title = display_name(matches[0]["source"], metadata_)
+    lines = [f"Here's what I found — **{lead_title}** ({matches[0]['location']}) says:\n\"{matches[0]['snippet']}\""]
+
+    for i, m in enumerate(matches[1:], start=1):
+        title = display_name(m["source"], metadata_)
+        connector = FOLLOWUP_CONNECTORS[(i - 1) % len(FOLLOWUP_CONNECTORS)]
+        lines.append(f"{connector} **{title}** ({m['location']}):\n\"{m['snippet']}\"")
+
+    return "\n\n".join(lines)
+
+
+# ------------------------------------------------------------------
+# 4c. Q&A logging — every question and answer gets appended to a CSV
+# ------------------------------------------------------------------
+def log_interaction(question, answer_text, matches, metadata_):
+    timestamp = datetime.now().isoformat(timespec="seconds")
+    if matches:
+        sources = "; ".join(
+            f"{display_name(m['source'], metadata_)} ({m['location']}, score {m['score']})"
+            for m in matches
+        )
+    else:
+        sources = ""
+
+    file_exists = os.path.exists(QA_LOG_FILE)
+    try:
+        with open(QA_LOG_FILE, "a", newline="", encoding="utf-8") as fh:
+            writer = csv.writer(fh)
+            if not file_exists:
+                writer.writerow(["timestamp", "question", "answer", "sources"])
+            writer.writerow([timestamp, question, answer_text, sources])
+    except OSError:
+        pass  # don't let logging failures break the chat experience
+
+
+# ------------------------------------------------------------------
 # 5. Generic / small-talk handling (no retrieval needed)
 # ------------------------------------------------------------------
 GREETINGS = {"hi", "hello", "hey", "hii", "hiya", "good morning", "good afternoon", "good evening"}
@@ -447,6 +500,14 @@ with st.sidebar:
             os.remove(CACHE_FILE)
         st.rerun()
 
+    st.divider()
+    st.subheader("Q&A log")
+    if os.path.exists(QA_LOG_FILE):
+        with open(QA_LOG_FILE, "rb") as fh:
+            st.download_button("⬇️ Download qa_log.csv", fh, file_name="qa_log.csv", mime="text/csv")
+    else:
+        st.caption("No questions logged yet.")
+
 if "messages" not in st.session_state:
     st.session_state.messages = [
         {"role": "assistant", "type": "text",
@@ -454,11 +515,13 @@ if "messages" not in st.session_state:
     ]
 
 
-def render_matches(matches, metadata_, page_texts_, msg_idx):
-    """Renders each match as a distinct card so it's visually clear which
-    part is the extracted excerpt vs. where it came from vs. the action
-    to see more — rather than one undifferentiated block of text."""
-    st.caption(f"🔎 Found {len(matches)} relevant passage(s):")
+def render_answer(summary, matches, metadata_, page_texts_, msg_idx):
+    """Shows the conversational summary up top (the natural-reading part),
+    then the individual match cards underneath as verifiable evidence —
+    so the flowing answer and the raw sources stay visually distinct."""
+    st.markdown(summary)
+    st.divider()
+    st.caption(f"📚 Sources — {len(matches)} passage(s) behind this answer:")
 
     for rank, m in enumerate(matches, start=1):
         title = display_name(m["source"], metadata_)
@@ -492,7 +555,7 @@ for idx, msg in enumerate(st.session_state.messages):
         if msg["type"] == "text":
             st.markdown(msg["content"])
         elif msg["type"] == "matches":
-            render_matches(msg["matches"], metadata, page_texts, idx)
+            render_answer(msg["summary"], msg["matches"], metadata, page_texts, idx)
 
 # New input
 question = st.chat_input("Ask a question...")
@@ -507,13 +570,19 @@ if question:
         if generic_reply is not None:
             st.markdown(generic_reply)
             st.session_state.messages.append({"role": "assistant", "type": "text", "content": generic_reply})
+            log_interaction(question, generic_reply, [], metadata)
         else:
             matches = get_top_matches(chunks, question)
             if not matches:
                 reply = "Sorry, I couldn't find anything relevant to that in the document(s)."
                 st.markdown(reply)
                 st.session_state.messages.append({"role": "assistant", "type": "text", "content": reply})
+                log_interaction(question, reply, [], metadata)
             else:
+                summary = build_conversational_summary(matches, metadata)
                 new_idx = len(st.session_state.messages)
-                render_matches(matches, metadata, page_texts, new_idx)
-                st.session_state.messages.append({"role": "assistant", "type": "matches", "matches": matches})
+                render_answer(summary, matches, metadata, page_texts, new_idx)
+                st.session_state.messages.append(
+                    {"role": "assistant", "type": "matches", "summary": summary, "matches": matches}
+                )
+                log_interaction(question, summary, matches, metadata)
