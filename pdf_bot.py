@@ -2,11 +2,13 @@ import os
 import re
 import csv
 import json
+import uuid
 import hashlib
 from datetime import datetime
 
 import fitz  # PyMuPDF
 import streamlit as st
+import pandas as pd
 from docx import Document
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
@@ -19,7 +21,8 @@ BOT_NAME = "GurucoolBOT"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DOCS_DIR = os.path.join(BASE_DIR, "documents")
 CACHE_FILE = os.path.join(BASE_DIR, "processed_data.json")
-QA_LOG_FILE = os.path.join(BASE_DIR, "qa_log.csv")  # every question+answer gets appended here
+QA_LOG_FILE = os.path.join(BASE_DIR, "qa_log.csv")          # every question+answer gets appended here
+SESSION_LOG_FILE = os.path.join(BASE_DIR, "session_log.csv")  # one row per app session (proxy for "visits")
 
 MIN_PARA_LEN = 40          # ignore tiny fragments (page numbers, headers)
 TOP_CHUNKS = 8              # how many chunks to consider before sentence-ranking
@@ -424,6 +427,89 @@ def log_interaction(question, answer_text, matches, metadata_):
 
 
 # ------------------------------------------------------------------
+# 4d. Session logging — one row per app session, our proxy for "visits"
+# since this is a local, single-file app with no real authentication.
+# ------------------------------------------------------------------
+def log_session_once():
+    if st.session_state.get("session_logged"):
+        return
+    st.session_state.session_logged = True
+    session_id = str(uuid.uuid4())
+    timestamp = datetime.now().isoformat(timespec="seconds")
+    file_exists = os.path.exists(SESSION_LOG_FILE)
+    try:
+        with open(SESSION_LOG_FILE, "a", newline="", encoding="utf-8") as fh:
+            writer = csv.writer(fh)
+            if not file_exists:
+                writer.writerow(["timestamp", "session_id"])
+            writer.writerow([timestamp, session_id])
+    except OSError:
+        pass
+
+
+# ------------------------------------------------------------------
+# 4e. Statistics page — FAQs, session counts, simple charts
+# ------------------------------------------------------------------
+def normalize_question(q):
+    q = re.sub(r"\s+", " ", q.strip().lower())
+    return q.rstrip("!?. ")
+
+
+def load_qa_log_df():
+    if not os.path.exists(QA_LOG_FILE):
+        return pd.DataFrame(columns=["timestamp", "question", "answer", "sources"])
+    return pd.read_csv(QA_LOG_FILE)
+
+
+def load_session_log_df():
+    if not os.path.exists(SESSION_LOG_FILE):
+        return pd.DataFrame(columns=["timestamp", "session_id"])
+    return pd.read_csv(SESSION_LOG_FILE)
+
+
+def render_stats_page():
+    st.header("📊 Statistics")
+    qa_df = load_qa_log_df()
+    session_df = load_session_log_df()
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Total questions asked", len(qa_df))
+    col2.metric("Sessions logged", len(session_df))
+    doc_answered = int((qa_df["sources"].fillna("").astype(str).str.strip() != "").sum()) if not qa_df.empty else 0
+    col3.metric("Answered from documents", doc_answered)
+    st.caption(
+        "\"Sessions\" counts distinct app visits (one per browser session) — "
+        "this app has no login system, so it's a visit count, not authenticated users."
+    )
+
+    if qa_df.empty:
+        st.info("No questions logged yet — ask something in the 💬 Chat tab first!")
+        return
+
+    st.subheader("🔥 Frequently Asked Questions")
+    qa_df["normalized"] = qa_df["question"].astype(str).apply(normalize_question)
+    top_questions = qa_df["normalized"].value_counts().head(10)
+    top_df = top_questions.rename_axis("question").reset_index(name="count")
+    st.bar_chart(top_df.set_index("question")["count"])
+    st.dataframe(top_df, use_container_width=True, hide_index=True)
+
+    st.subheader("📅 Questions Over Time")
+    qa_df["date"] = pd.to_datetime(qa_df["timestamp"], errors="coerce").dt.date
+    per_day = qa_df.dropna(subset=["date"]).groupby("date").size()
+    if len(per_day) > 1:
+        st.line_chart(per_day)
+    else:
+        st.caption("Not enough days of data yet for a trend line.")
+
+    st.subheader("🧭 Answer Source Breakdown")
+    breakdown = pd.Series({
+        "Answered from documents": doc_answered,
+        "Generic / small talk": len(qa_df) - doc_answered
+    })
+    st.bar_chart(breakdown)
+
+
+# ------------------------------------------------------------------
 # 5. Generic / small-talk handling (no retrieval needed)
 # ------------------------------------------------------------------
 GREETINGS = {"hi", "hello", "hey", "hii", "hiya", "good morning", "good afternoon", "good evening"}
@@ -468,7 +554,10 @@ def handle_generic(question, metadata):
         lines = [f"- **{f['guessed_title']}**: {f['extent_label']}" for f in metadata["files"]]
         return f"I have {len(metadata['files'])} document(s) loaded:\n" + "\n".join(lines)
 
-    if re.search(r"what (documents|files|pdfs) (do you have|are loaded|can you read)", q):
+    # Broad, typo-tolerant match for "what documents/files do you have" style
+    # questions — keyword-based rather than a strict phrase match, since real
+    # users phrase this many different ways ("what are you documents you have").
+    if re.search(r"\b(document|doc|pdf|file)s?\b", q) and re.search(r"\b(have|got|loaded|available)\b", q):
         if metadata["files"]:
             names = ", ".join(f["filename"] for f in metadata["files"])
             return f"Loaded documents: {names}"
@@ -481,16 +570,21 @@ def handle_generic(question, metadata):
 # 6. Streamlit chat UI
 # ------------------------------------------------------------------
 st.set_page_config(page_title=BOT_NAME, page_icon="🎓")
-st.title(f"🎓 {BOT_NAME}")
 
 os.makedirs(DOCS_DIR, exist_ok=True)
 chunks, metadata, page_texts = get_chunks_and_metadata()
 
 if not chunks:
+    st.title(f"🎓 {BOT_NAME}")
     st.warning(f"No PDF or Word files found in `{DOCS_DIR}`. Add files there and refresh the page.")
     st.stop()
 
+log_session_once()
+
 with st.sidebar:
+    page = st.radio("Navigate", ["💬 Chat", "📊 Statistics"], label_visibility="collapsed")
+    st.divider()
+
     st.subheader("Loaded documents")
     for f in metadata["files"]:
         st.write(f"**{f['guessed_title']}** ({f['file_type'].upper()}, {f['extent_label']})")
@@ -507,6 +601,12 @@ with st.sidebar:
             st.download_button("⬇️ Download qa_log.csv", fh, file_name="qa_log.csv", mime="text/csv")
     else:
         st.caption("No questions logged yet.")
+
+if page == "📊 Statistics":
+    render_stats_page()
+    st.stop()
+
+st.title(f"🎓 {BOT_NAME}")
 
 if "messages" not in st.session_state:
     st.session_state.messages = [
