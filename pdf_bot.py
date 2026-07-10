@@ -50,7 +50,7 @@ DOCS_DIR = os.path.join(BASE_DIR, "documents")
 CACHE_FILE = os.path.join(BASE_DIR, "processed_data.json")
 QA_LOG_FILE = os.path.join(BASE_DIR, "qa_log.csv")            # every question+answer gets appended here
 SESSION_LOG_FILE = os.path.join(BASE_DIR, "session_log.csv")  # one row per login (now tracks real usernames)
-USERS_FILE = os.path.join(BASE_DIR, "users.json")             # hashed+salted credentials
+USERS_FILE = os.path.join(BASE_DIR, "users.csv")              # hashed+salted credentials
 
 MIN_PARA_LEN = 40          # ignore tiny fragments (page numbers, headers)
 TOP_CHUNKS = 8              # how many chunks to consider before sentence-ranking
@@ -518,10 +518,26 @@ def log_interaction(question, answer_text, matches, metadata_, username):
 # 4d. Authentication — file-based, interim until SSO is wired up
 # ------------------------------------------------------------------
 def load_users():
+    """users.csv columns: username, salt, hash — never plaintext passwords."""
     if not os.path.exists(USERS_FILE):
         return {}
-    with open(USERS_FILE, "r", encoding="utf-8") as fh:
-        return json.load(fh)
+    users = {}
+    with open(USERS_FILE, "r", newline="", encoding="utf-8") as fh:
+        reader = csv.DictReader(fh)
+        for row in reader:
+            username = (row.get("username") or "").strip()
+            if not username:
+                continue
+            users[username] = {"salt": row["salt"], "hash": row["hash"]}
+    return users
+
+
+def save_users(users):
+    with open(USERS_FILE, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(["username", "salt", "hash"])
+        for username, record in users.items():
+            writer.writerow([username, record["salt"], record["hash"]])
 
 
 def hash_password(password, salt_hex=None):
@@ -545,27 +561,65 @@ def check_login(username, password):
     return verify_password(password, record["salt"], record["hash"])
 
 
+def register_user(username, password):
+    """Self-service account creation from within the app. Returns
+    (success, message). Same hashing scheme as manage_users.py, so
+    accounts created either way are fully interchangeable."""
+    username = username.strip()
+    if not username:
+        return False, "Username cannot be empty."
+    if len(password) < 6:
+        return False, "Password must be at least 6 characters."
+
+    users = load_users()
+    if username in users:
+        return False, f"Username '{username}' is already taken."
+
+    salt_hex, hash_hex = hash_password(password)
+    users[username] = {"salt": salt_hex, "hash": hash_hex}
+    save_users(users)
+    return True, f"Account '{username}' created. Switch to the Sign in tab to log in."
+
+
 def render_login():
     st.title(f"🔐 {BOT_NAME} — Sign in")
-    users = load_users()
-    if not users:
-        st.info(
-            "No accounts exist yet. Have an admin run this in the project folder:\n\n"
-            "`python manage_users.py add <username>`"
-        )
 
-    with st.form("login_form"):
-        username = st.text_input("Username")
-        password = st.text_input("Password", type="password")
-        submitted = st.form_submit_button("Sign in")
+    tab_signin, tab_signup = st.tabs(["Sign in", "Create account"])
 
-    if submitted:
-        if check_login(username, password):
-            st.session_state.authenticated = True
-            st.session_state.username = username
-            st.rerun()
-        else:
-            st.error("Invalid username or password.")
+    with tab_signin:
+        if not load_users():
+            st.info("No accounts exist yet — use the **Create account** tab to make one.")
+
+        with st.form("login_form"):
+            username = st.text_input("Username")
+            password = st.text_input("Password", type="password")
+            submitted = st.form_submit_button("Sign in")
+
+        if submitted:
+            if check_login(username, password):
+                st.session_state.authenticated = True
+                st.session_state.username = username
+                st.rerun()
+            else:
+                st.error("Invalid username or password.")
+
+    with tab_signup:
+        st.caption("Create your own login — no admin needed for this interim setup.")
+        with st.form("signup_form"):
+            new_username = st.text_input("Choose a username", key="signup_username")
+            new_password = st.text_input("Choose a password", type="password", key="signup_password")
+            confirm_password = st.text_input("Confirm password", type="password", key="signup_confirm")
+            signup_submitted = st.form_submit_button("Create account")
+
+        if signup_submitted:
+            if new_password != confirm_password:
+                st.error("Passwords don't match.")
+            else:
+                success, message = register_user(new_username, new_password)
+                if success:
+                    st.success(message)
+                else:
+                    st.error(message)
 
 
 # ------------------------------------------------------------------
