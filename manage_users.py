@@ -1,19 +1,3 @@
-"""
-manage_users.py — admin CLI for GurucoolBOT's interim login system
---------------------------------------------------------------------
-Passwords are never stored in plaintext: each one is hashed with
-PBKDF2-HMAC-SHA256 and a random per-user salt, written to users.json
-next to this script.
-
-This is meant as a stopgap until SSO is wired up — swap it out once
-that's approved.
-
-Usage:
-    python manage_users.py add <username>       # create or reset a user
-    python manage_users.py remove <username>     # delete a user
-    python manage_users.py list                  # show all usernames
-"""
-
 import argparse
 import getpass
 import json
