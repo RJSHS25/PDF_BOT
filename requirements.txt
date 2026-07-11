@@ -23,11 +23,11 @@ threadpoolctl>=3.5.0
 # -------------------------
 # Semantic Search: OFF
 # Enable using:
-# pip install sentence-transformers
+pip install sentence-transformers
 #
 # Local Embeddings
-# sentence-transformers>=3.0.0
+sentence-transformers>=3.0.0
 #
-# Local Vector Database
-# faiss-cpu
-# chromadb
+Local Vector Database
+faiss-cpu
+chromadb
