@@ -673,6 +673,67 @@ def concise_snippet(chunk_text, question, term):
         return " ".join(sentences[:MAX_ANSWER_SENTENCES])
 
 
+# ------------------------------------------------------------------
+# 4b. Conversational memory (within a session) — short follow-ups like
+# "tell me more" or "what about that" carry no searchable content on
+# their own. Detect them and blend in the last substantive question so
+# retrieval stays on-topic, without an LLM doing any actual reasoning.
+# ------------------------------------------------------------------
+FOLLOWUP_PHRASES = {
+    "tell me more", "more detail", "more details", "more info", "more information",
+    "go on", "continue", "elaborate", "explain more", "explain further",
+    "what about it", "what about that", "and then", "what else", "anything else",
+}
+
+
+def is_followup_question(question):
+    q = question.strip().lower().rstrip("?!. ")
+    if q in FOLLOWUP_PHRASES:
+        return True
+    if q.startswith(("and ", "what about", "how about", "tell me more")):
+        return True
+    # short question that leans on a pronoun instead of naming its own subject
+    # e.g. "what is that code", "explain it" — but not "what is strategy"
+    if len(q.split()) <= 4 and re.search(r"\b(it|that|this|those|them)\b", q):
+        return True
+    return False
+
+
+def build_effective_query(question):
+    """Returns (effective_query, was_followup). Only expands the query for
+    retrieval — the original question is still what gets displayed/logged."""
+    if is_followup_question(question):
+        anchor = st.session_state.get("last_substantive_question", "")
+        if anchor:
+            return f"{anchor} {question}".strip(), True
+    return question, False
+
+
+# ------------------------------------------------------------------
+# 4c. Cross-session memory — recall from the Q&A log itself, since every
+# question is already logged per user. No separate memory store needed.
+# ------------------------------------------------------------------
+HISTORY_RECALL_PATTERN = re.compile(
+    r"\b(what (did|have) (i|we) (ask|discuss)|previous questions?|question history|"
+    r"recap (our|the) conversation|(talked|discussed) about (before|earlier|previously))\b",
+    re.IGNORECASE
+)
+
+
+def handle_history_recall(question, username):
+    if not HISTORY_RECALL_PATTERN.search(question.strip().lower()):
+        return None
+    df = load_qa_log_df()
+    if df.empty or "username" not in df.columns:
+        return "I don't have any question history yet — this looks like our first exchange."
+    user_df = df[df["username"] == username]
+    if user_df.empty:
+        return "I don't have any earlier questions from you on record yet."
+    recent = user_df.tail(5)
+    lines = [f"- {row['question']}" for _, row in recent.iterrows()]
+    return "Here's what you've asked me recently:\n" + "\n".join(lines)
+
+
 def get_top_matches(chunks, question, chunk_embeddings=None, top_n=TOP_MATCHES):
     """Returns up to top_n distinct matches, each with a short snippet plus
     the full chunk text (for the 'read more' expander).
@@ -1174,7 +1235,8 @@ if question:
     with st.chat_message("user"):
         st.markdown(question)
 
-    generic_reply = handle_generic(question, metadata)
+    history_reply = handle_history_recall(question, st.session_state.username)
+    generic_reply = history_reply if history_reply is not None else handle_generic(question, metadata)
 
     with st.chat_message("assistant"):
         if generic_reply is not None:
@@ -1182,13 +1244,20 @@ if question:
             st.session_state.messages.append({"role": "assistant", "type": "text", "content": generic_reply})
             log_interaction(question, generic_reply, [], metadata, st.session_state.username)
         else:
-            matches = get_top_matches(chunks, question, chunk_embeddings)
+            effective_query, was_followup = build_effective_query(question)
+            matches = get_top_matches(chunks, effective_query, chunk_embeddings)
+
+            if was_followup and matches:
+                st.caption(f"↪ Following up on: \"{st.session_state.last_substantive_question}\"")
+
             if not matches:
                 reply = "Sorry, I couldn't find anything relevant to that in the document(s)."
                 st.markdown(reply)
                 st.session_state.messages.append({"role": "assistant", "type": "text", "content": reply})
                 log_interaction(question, reply, [], metadata, st.session_state.username)
             else:
+                if not was_followup:
+                    st.session_state.last_substantive_question = question
                 summary = build_conversational_summary(matches, metadata)
                 new_idx = len(st.session_state.messages)
                 render_answer(summary, matches, metadata, page_texts, new_idx)
