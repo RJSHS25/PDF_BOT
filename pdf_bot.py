@@ -1,26 +1,40 @@
 """
 GurucoolBOT — Local Document Q&A Chatbot
 -----------------------------------------
-No API calls, no external LLM. Pure TF-IDF retrieval with sklearn.
-Reads both PDF (.pdf) and Word (.docx) files.
+No API calls, no external LLM. Hybrid retrieval: TF-IDF (exact terms,
+codes, numbers) + local sentence-transformer embeddings (semantic
+matching — typos, synonyms, paraphrasing). Purely extractive: it always
+hands back real excerpts from your files, never generated text, so it
+can't hallucinate.
+
+Reads PDF (.pdf), Word (.docx), Excel (.xlsx), and CSV (.csv) files.
 
 Folder layout expected (all relative to this .py file):
 
     your_project/
     ├── pdf_chatbot.py
     ├── manage_users.py         <- CLI to create/update/remove logins
-    ├── documents/              <- put your .pdf and .docx files here
-    ├── users.json              <- auto-created; hashed passwords (never plaintext)
-    └── processed_data.json     <- auto-created cache (do not edit)
+    ├── documents/              <- put your .pdf/.docx/.xlsx/.csv files here
+    ├── users.csv               <- auto-created; hashed passwords (never plaintext)
+    ├── processed_data.json     <- auto-created chunk cache, per file (do not edit)
+    ├── embeddings_meta.json    <- auto-created embedding cache index (do not edit)
+    └── .embeddings_cache/      <- auto-created per-file embedding vectors (do not edit)
 
 Run with:  streamlit run pdf_chatbot.py
 
-Dependencies:  pip install streamlit pymupdf python-docx scikit-learn pandas
+Dependencies:
+    pip install streamlit pymupdf python-docx scikit-learn pandas openpyxl numpy
+    pip install sentence-transformers   # optional but recommended — enables
+                                         # semantic search. Without it, the
+                                         # app still runs fine on TF-IDF alone.
+    First run downloads the embedding model (~80MB, one-time, needs internet).
+    After that, everything runs 100% locally — no per-query API calls.
 
-IMPORTANT: add users.json, qa_log.csv, session_log.csv, and processed_data.json
-to .gitignore — none of them belong in version control.
+IMPORTANT: add users.csv, qa_log.csv, session_log.csv, processed_data.json,
+embeddings_meta.json, and .embeddings_cache/ to .gitignore — none of them
+belong in version control.
 
-Interim login: this is file-based auth (hashed+salted passwords in users.json)
+Interim login: this is file-based auth (hashed+salted passwords in users.csv)
 meant as a stopgap until real SSO is wired up. Create accounts with:
     python manage_users.py add <username>
 """
@@ -36,9 +50,16 @@ from datetime import datetime
 import fitz  # PyMuPDF
 import streamlit as st
 import pandas as pd
+import numpy as np
 from docx import Document
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
+
+try:
+    from sentence_transformers import SentenceTransformer
+    SEMANTIC_SEARCH_AVAILABLE = True
+except ImportError:
+    SEMANTIC_SEARCH_AVAILABLE = False
 
 # ------------------------------------------------------------------
 # Config
@@ -48,6 +69,7 @@ BOT_NAME = "GurucoolBOT"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DOCS_DIR = os.path.join(BASE_DIR, "documents")
 CACHE_FILE = os.path.join(BASE_DIR, "processed_data.json")
+EMBEDDINGS_META_FILE = os.path.join(BASE_DIR, "embeddings_meta.json")
 QA_LOG_FILE = os.path.join(BASE_DIR, "qa_log.csv")            # every question+answer gets appended here
 SESSION_LOG_FILE = os.path.join(BASE_DIR, "session_log.csv")  # one row per login (now tracks real usernames)
 USERS_FILE = os.path.join(BASE_DIR, "users.csv")              # hashed+salted credentials
@@ -58,8 +80,13 @@ TOP_MATCHES = 3             # how many distinct matches to show the user
 MAX_ANSWER_SENTENCES = 2    # keep each match's snippet short
 DOCX_SECTION_CHUNK_CHARS = 500  # roughly how much text goes in one docx chunk
 CACHE_VERSION = 4           # bump whenever the chunk/metadata schema changes
+EMBED_MODEL_NAME = "all-MiniLM-L6-v2"  # small, fast, runs fine on CPU
+EMBED_CACHE_VERSION = 1     # bump if you change EMBED_MODEL_NAME
+MAX_CPU_THREADS = None      # e.g. set to 2 to cap CPU usage during embedding
+                            # (trades speed for lower load); None = let PyTorch decide
+TFIDF_WEIGHT = 0.5          # hybrid score = TFIDF_WEIGHT * lexical + (1-TFIDF_WEIGHT) * semantic
 
-SUPPORTED_EXTENSIONS = (".pdf", ".docx")
+SUPPORTED_EXTENSIONS = (".pdf", ".docx", ".xlsx", ".csv")
 
 
 # ------------------------------------------------------------------
@@ -69,18 +96,6 @@ def list_documents(folder):
     if not os.path.isdir(folder):
         return []
     return sorted(f for f in os.listdir(folder) if f.lower().endswith(SUPPORTED_EXTENSIONS))
-
-
-def folder_fingerprint(folder):
-    """A cheap hash of filenames + sizes + mtimes, so we can detect changes
-    without re-reading every file's contents."""
-    items = []
-    for f in list_documents(folder):
-        path = os.path.join(folder, f)
-        stat = os.stat(path)
-        items.append(f"{f}:{stat.st_size}:{int(stat.st_mtime)}")
-    raw = "|".join(items)
-    return hashlib.md5(raw.encode("utf-8")).hexdigest()
 
 
 # ------------------------------------------------------------------
@@ -198,6 +213,11 @@ def process_pdf(path, filename):
     else:
         sample_pages = [doc[i].get_text() for i in range(min(2, page_count))]
         author = guess_author_from_text(sample_pages)
+
+    # Count embedded images — we don't OCR or interpret them (that's a
+    # separate, CPU-heavier feature), but at least surface that they
+    # exist rather than silently dropping them with no trace.
+    image_count = sum(len(page.get_images()) for page in doc)
     doc.close()
 
     chunks, page_texts = read_pdf(path, filename)
@@ -206,7 +226,8 @@ def process_pdf(path, filename):
         "file_type": "pdf",
         "guessed_title": title,
         "author": author,
-        "extent_label": f"{page_count} pages"
+        "extent_label": f"{page_count} pages",
+        "image_count": image_count
     }
     return chunks, page_texts, file_meta
 
@@ -273,6 +294,7 @@ def process_docx(path, filename):
         title = filename
 
     author = (core.author or "").strip() or None
+    image_count = sum(1 for rel in document.part.rels.values() if "image" in rel.reltype)
 
     chunks, page_texts = read_docx(path, filename)
     file_meta = {
@@ -280,39 +302,111 @@ def process_docx(path, filename):
         "file_type": "docx",
         "guessed_title": title,
         "author": author,
-        "extent_label": f"{len(page_texts)} section(s)"
+        "extent_label": f"{len(page_texts)} section(s)",
+        "image_count": image_count
     }
     return chunks, page_texts, file_meta
 
 
 # ------------------------------------------------------------------
-# 2c. Unified processing across all supported file types
+# 2c. Excel (.xlsx) and CSV extraction — one clean chunk per row, same
+# approach that fixed PDF tables: never flatten tabular data into a blob.
 # ------------------------------------------------------------------
-def process_all_documents(folder):
-    all_chunks = []
-    all_page_texts = {}
-    metadata = {"files": []}
+def _row_chunks_from_dataframe(df, filename, location_prefix):
+    """Turns a DataFrame into (chunks, page_texts) using the same
+    'Column: value | Column: value' row format as PDF tables."""
+    chunks = []
+    page_texts = {}
+    columns = [str(c).strip() for c in df.columns]
+    full_rows_text = []
 
-    for f in list_documents(folder):
-        path = os.path.join(folder, f)
-        ext = os.path.splitext(f)[1].lower()
+    for r_idx, row in enumerate(df.itertuples(index=False), start=1):
+        cells = ["" if pd.isna(v) else str(v).strip() for v in row]
+        if not any(cells):
+            continue
+        pairs = [f"{col}: {val}" for col, val in zip(columns, cells) if val]
+        if not pairs:
+            continue
+        row_text = " | ".join(pairs)
+        full_rows_text.append(row_text)
+        row_key = cells[0] if cells[0] else f"row {r_idx}"
+        location = f"{location_prefix}, Row {r_idx} ({row_key})"
+        chunks.append({"source": filename, "location": location, "text": row_text})
+        page_texts[location] = row_text
 
-        if ext == ".pdf":
-            chunks, page_texts, file_meta = process_pdf(path, f)
-        elif ext == ".docx":
-            chunks, page_texts, file_meta = process_docx(path, f)
-        else:
-            continue  # unsupported, shouldn't happen given list_documents filter
+    # Also store the whole sheet/file as one lookup for a "view full sheet" option
+    page_texts[location_prefix] = "\n".join(full_rows_text)
+    return chunks, page_texts
 
-        metadata["files"].append(file_meta)
-        all_chunks.extend(chunks)
-        all_page_texts[f] = page_texts
 
-    return all_chunks, metadata, all_page_texts
+def read_excel(path, filename):
+    chunks = []
+    page_texts = {}
+    sheets = pd.read_excel(path, sheet_name=None, dtype=str)
+    for sheet_name, df in sheets.items():
+        location_prefix = f"Sheet: {sheet_name}"
+        sheet_chunks, sheet_page_texts = _row_chunks_from_dataframe(df, filename, location_prefix)
+        chunks.extend(sheet_chunks)
+        page_texts.update(sheet_page_texts)
+    return chunks, page_texts, sheets
+
+
+def process_excel(path, filename):
+    chunks, page_texts, sheets = read_excel(path, filename)
+    total_rows = sum(len(df) for df in sheets.values())
+    file_meta = {
+        "filename": filename,
+        "file_type": "xlsx",
+        "guessed_title": filename,
+        "author": None,
+        "extent_label": f"{len(sheets)} sheet(s), {total_rows} row(s)"
+    }
+    return chunks, page_texts, file_meta
+
+
+def read_csv_file(path, filename):
+    df = pd.read_csv(path, dtype=str)
+    location_prefix = "Data"
+    chunks, page_texts = _row_chunks_from_dataframe(df, filename, location_prefix)
+    return chunks, page_texts, len(df)
+
+
+def process_csv(path, filename):
+    chunks, page_texts, row_count = read_csv_file(path, filename)
+    file_meta = {
+        "filename": filename,
+        "file_type": "csv",
+        "guessed_title": filename,
+        "author": None,
+        "extent_label": f"{row_count} row(s)"
+    }
+    return chunks, page_texts, file_meta
 
 
 # ------------------------------------------------------------------
-# 3. Cache load/save
+# 2d. Per-file dispatch (used by the incremental cache below)
+# ------------------------------------------------------------------
+
+
+def process_one_document(path, filename):
+    ext = os.path.splitext(filename)[1].lower()
+    if ext == ".pdf":
+        return process_pdf(path, filename)
+    elif ext == ".docx":
+        return process_docx(path, filename)
+    elif ext == ".xlsx":
+        return process_excel(path, filename)
+    elif ext == ".csv":
+        return process_csv(path, filename)
+    return [], {}, None
+
+
+# ------------------------------------------------------------------
+# 3. Cache load/save — PER FILE, not per folder. Adding one new document
+# no longer re-parses every other file from scratch: only new/changed
+# files get reprocessed, which is the real lever for both processing
+# time and CPU load (bigger win than parallelizing, and none of the
+# risk multiprocessing carries inside a Streamlit script).
 # ------------------------------------------------------------------
 def load_cache():
     if os.path.exists(CACHE_FILE):
@@ -321,29 +415,177 @@ def load_cache():
     return None
 
 
-def save_cache(fingerprint, chunks, metadata, page_texts):
+def save_cache(files_cache):
     with open(CACHE_FILE, "w", encoding="utf-8") as fh:
-        json.dump({
-            "fingerprint": fingerprint,
-            "version": CACHE_VERSION,
-            "chunks": chunks,
-            "metadata": metadata,
-            "page_texts": page_texts
-        }, fh)
+        json.dump({"version": CACHE_VERSION, "files": files_cache}, fh)
+
+
+def _file_fingerprint(path):
+    stat = os.stat(path)
+    return f"{stat.st_size}:{int(stat.st_mtime)}"
 
 
 def get_chunks_and_metadata():
-    """Returns (chunks, metadata, page_texts), using the on-disk cache
-    whenever the documents/ folder hasn't changed since last run."""
-    fingerprint = folder_fingerprint(DOCS_DIR)
-    cached = load_cache()
-    if cached and cached.get("fingerprint") == fingerprint and cached.get("version") == CACHE_VERSION:
-        return cached["chunks"], cached["metadata"], cached.get("page_texts", {})
+    """Returns (chunks, metadata, page_texts, file_index, timing).
 
-    chunks, metadata, page_texts = process_all_documents(DOCS_DIR)
-    if chunks:
-        save_cache(fingerprint, chunks, metadata, page_texts)
-    return chunks, metadata, page_texts
+    file_index: ordered list of (filename, fingerprint, chunk_start, chunk_end)
+    so the embedding layer can reuse per-file vectors too, without needing
+    to re-derive file boundaries by re-scanning everything.
+
+    timing: {"reused_files": n, "processed_files": n, "seconds": float}
+    — real numbers from your machine, not an estimate.
+    """
+    import time
+    t_start = time.perf_counter()
+
+    cached = load_cache()
+    cached_files = cached.get("files", {}) if (cached and cached.get("version") == CACHE_VERSION) else {}
+
+    all_chunks, all_page_texts = [], {}
+    metadata = {"files": []}
+    updated_cache = {}
+    file_index = []
+    reused_count, processed_count = 0, 0
+    changed = False
+
+    for f in list_documents(DOCS_DIR):
+        path = os.path.join(DOCS_DIR, f)
+        fp = _file_fingerprint(path)
+
+        if f in cached_files and cached_files[f].get("fingerprint") == fp:
+            entry = cached_files[f]
+            reused_count += 1
+        else:
+            chunks, page_texts, file_meta = process_one_document(path, f)
+            if file_meta is None:
+                continue
+            entry = {"fingerprint": fp, "chunks": chunks, "page_texts": page_texts, "file_meta": file_meta}
+            processed_count += 1
+            changed = True
+
+        updated_cache[f] = entry
+        start = len(all_chunks)
+        all_chunks.extend(entry["chunks"])
+        all_page_texts[f] = entry["page_texts"]
+        metadata["files"].append(entry["file_meta"])
+        file_index.append((f, entry["fingerprint"], start, len(all_chunks)))
+
+    if set(updated_cache.keys()) != set(cached_files.keys()):
+        changed = True  # a file was removed from documents/
+
+    if changed:
+        save_cache(updated_cache)
+
+    elapsed = round(time.perf_counter() - t_start, 2)
+    timing = {"reused_files": reused_count, "processed_files": processed_count, "seconds": elapsed}
+    return all_chunks, metadata, all_page_texts, file_index, timing
+
+
+# ------------------------------------------------------------------
+# 3b. Local embeddings — semantic search layer (optional; degrades to
+# TF-IDF-only if sentence-transformers isn't installed). Nothing here
+# ever calls an external API: the model runs locally after its one-time
+# download, so there's no per-query network call or cost.
+#
+# Cached PER FILE (not one big array) for the same reason as the text
+# cache above: adding one new document shouldn't force re-embedding
+# everything else you already had.
+# ------------------------------------------------------------------
+EMBEDDINGS_CACHE_DIR = os.path.join(BASE_DIR, ".embeddings_cache")
+
+
+@st.cache_resource(show_spinner="Loading semantic search model (first time only)...")
+def load_embedding_model():
+    if MAX_CPU_THREADS:
+        import torch
+        torch.set_num_threads(MAX_CPU_THREADS)
+    return SentenceTransformer(EMBED_MODEL_NAME)
+
+
+def compute_embeddings(texts):
+    model = load_embedding_model()
+    return model.encode(texts, show_progress_bar=False, convert_to_numpy=True, normalize_embeddings=True)
+
+
+def _embedding_cache_path(filename):
+    # hash the filename for a safe, fixed-length cache filename
+    digest = hashlib.md5(filename.encode("utf-8")).hexdigest()
+    return os.path.join(EMBEDDINGS_CACHE_DIR, f"{digest}.npy")
+
+
+def get_chunk_embeddings(all_chunks, file_index):
+    """Returns a normalized (num_chunks, dim) numpy array aligned with
+    all_chunks, or None if semantic search isn't available. Only files
+    that are new or changed since last run get re-embedded — everyone
+    else's vectors are loaded straight from disk."""
+    if not SEMANTIC_SEARCH_AVAILABLE or not all_chunks:
+        return None, {"reused_files": 0, "embedded_files": 0, "seconds": 0.0}
+
+    import time
+    t_start = time.perf_counter()
+    os.makedirs(EMBEDDINGS_CACHE_DIR, exist_ok=True)
+
+    meta = {}
+    if os.path.exists(EMBEDDINGS_META_FILE):
+        try:
+            with open(EMBEDDINGS_META_FILE, "r", encoding="utf-8") as fh:
+                meta = json.load(fh)
+        except (json.JSONDecodeError, OSError):
+            meta = {}
+    meta_files = meta.get("files", {}) if (
+        meta.get("model") == EMBED_MODEL_NAME and meta.get("version") == EMBED_CACHE_VERSION
+    ) else {}
+
+    pieces = []
+    updated_meta_files = {}
+    reused, embedded = 0, 0
+
+    for filename, fingerprint, start, end in file_index:
+        num_chunks = end - start
+        if num_chunks == 0:
+            updated_meta_files[filename] = {"fingerprint": fingerprint, "count": 0}
+            continue
+
+        cached_entry = meta_files.get(filename)
+        cache_path = _embedding_cache_path(filename)
+
+        if (cached_entry and cached_entry.get("fingerprint") == fingerprint
+                and cached_entry.get("count") == num_chunks and os.path.exists(cache_path)):
+            try:
+                vecs = np.load(cache_path)
+                if vecs.shape[0] == num_chunks:
+                    pieces.append(vecs)
+                    updated_meta_files[filename] = cached_entry
+                    reused += 1
+                    continue
+            except (OSError, ValueError):
+                pass  # fall through and recompute this file
+
+        texts = [c["text"] for c in all_chunks[start:end]]
+        vecs = compute_embeddings(texts)
+        try:
+            np.save(cache_path, vecs)
+        except OSError:
+            pass
+        pieces.append(vecs)
+        updated_meta_files[filename] = {"fingerprint": fingerprint, "count": num_chunks}
+        embedded += 1
+
+    embeddings = np.vstack(pieces) if pieces else None
+
+    if embedded > 0 or set(meta_files.keys()) != set(updated_meta_files.keys()):
+        try:
+            with open(EMBEDDINGS_META_FILE, "w", encoding="utf-8") as fh:
+                json.dump({
+                    "version": EMBED_CACHE_VERSION,
+                    "model": EMBED_MODEL_NAME,
+                    "files": updated_meta_files
+                }, fh)
+        except OSError:
+            pass
+
+    elapsed = round(time.perf_counter() - t_start, 2)
+    return embeddings, {"reused_files": reused, "embedded_files": embedded, "seconds": elapsed}
 
 
 # ------------------------------------------------------------------
@@ -431,21 +673,36 @@ def concise_snippet(chunk_text, question, term):
         return " ".join(sentences[:MAX_ANSWER_SENTENCES])
 
 
-def get_top_matches(chunks, question, top_n=TOP_MATCHES):
+def get_top_matches(chunks, question, chunk_embeddings=None, top_n=TOP_MATCHES):
     """Returns up to top_n distinct matches, each with a short snippet plus
-    the full chunk text (for the 'read more' expander)."""
+    the full chunk text (for the 'read more' expander).
+
+    Hybrid scoring: TF-IDF cosine (catches exact terms, codes, numbers)
+    blended with sentence-embedding cosine (catches typos, synonyms,
+    paraphrasing) when semantic search is available. Falls back to
+    TF-IDF alone otherwise — same behavior as before."""
     texts = tuple(c["text"] for c in chunks)
     vectorizer, vectors = build_vectorizer(texts)
     question_vector = vectorizer.transform([question])
-    scores = cosine_similarity(question_vector, vectors)[0]
-    ranked = scores.argsort()[::-1]
+    tfidf_scores = cosine_similarity(question_vector, vectors)[0]
+
+    semantic_scores = None
+    if chunk_embeddings is not None:
+        model = load_embedding_model()
+        q_embedding = model.encode([question], convert_to_numpy=True, normalize_embeddings=True)[0]
+        semantic_scores = np.clip(chunk_embeddings @ q_embedding, 0, None)
+        combined_scores = TFIDF_WEIGHT * tfidf_scores + (1 - TFIDF_WEIGHT) * semantic_scores
+    else:
+        combined_scores = tfidf_scores
+
+    ranked = combined_scores.argsort()[::-1]
 
     term = extract_definition_term(question)
     matches = []
     seen_locations = set()
 
     for i in ranked:
-        if scores[i] <= 0 or len(matches) >= top_n:
+        if combined_scores[i] <= 0 or len(matches) >= top_n:
             break
         chunk = chunks[i]
         key = (chunk["source"], chunk["location"])
@@ -458,7 +715,9 @@ def get_top_matches(chunks, question, top_n=TOP_MATCHES):
             "location": chunk["location"],
             "snippet": concise_snippet(chunk["text"], question, term),
             "full_text": chunk["text"],
-            "score": round(float(scores[i]), 2)
+            "score": round(float(combined_scores[i]), 2),
+            "tfidf_score": round(float(tfidf_scores[i]), 2),
+            "semantic_score": round(float(semantic_scores[i]), 2) if semantic_scores is not None else None
         })
 
     return matches
@@ -780,12 +1039,14 @@ if not st.session_state.authenticated:
 log_session_once()
 
 os.makedirs(DOCS_DIR, exist_ok=True)
-chunks, metadata, page_texts = get_chunks_and_metadata()
+chunks, metadata, page_texts, file_index, text_timing = get_chunks_and_metadata()
 
 if not chunks:
     st.title(f"🎓 {BOT_NAME}")
-    st.warning(f"No PDF or Word files found in `{DOCS_DIR}`. Add files there and refresh the page.")
+    st.warning(f"No supported files found in `{DOCS_DIR}`. Add PDF, Word, Excel, or CSV files there and refresh.")
     st.stop()
+
+chunk_embeddings, embed_timing = get_chunk_embeddings(chunks, file_index)
 
 with st.sidebar:
     st.caption(f"Signed in as **{st.session_state.username}**")
@@ -801,11 +1062,40 @@ with st.sidebar:
     st.subheader("Loaded documents")
     for f in metadata["files"]:
         st.write(f"**{f['guessed_title']}** ({f['file_type'].upper()}, {f['extent_label']})")
+
+    total_images = sum(f.get("image_count", 0) or 0 for f in metadata["files"])
+    if total_images:
+        st.caption(
+            f"🖼️ {total_images} image(s) detected across your documents — "
+            "not searchable yet (no OCR/image understanding built in)."
+        )
     if st.button("🔄 Re-scan documents/ folder"):
         st.cache_resource.clear()
         if os.path.exists(CACHE_FILE):
             os.remove(CACHE_FILE)
+        if os.path.exists(EMBEDDINGS_META_FILE):
+            os.remove(EMBEDDINGS_META_FILE)
+        if os.path.isdir(EMBEDDINGS_CACHE_DIR):
+            for fn in os.listdir(EMBEDDINGS_CACHE_DIR):
+                os.remove(os.path.join(EMBEDDINGS_CACHE_DIR, fn))
         st.rerun()
+
+    st.divider()
+    if SEMANTIC_SEARCH_AVAILABLE:
+        st.caption("🧠 Semantic search: **on** (hybrid TF-IDF + embeddings)")
+    else:
+        st.caption("🧠 Semantic search: **off** — `pip install sentence-transformers` to enable")
+
+    with st.expander("⏱️ Processing time (this run)"):
+        st.caption(
+            f"Text/table extraction: {text_timing['seconds']}s "
+            f"({text_timing['processed_files']} processed, {text_timing['reused_files']} reused from cache)"
+        )
+        st.caption(
+            f"Embeddings: {embed_timing['seconds']}s "
+            f"({embed_timing['embedded_files']} embedded, {embed_timing['reused_files']} reused from cache)"
+        )
+        st.caption(f"{len(chunks)} total chunks")
 
     st.divider()
     st.subheader("Q&A log")
@@ -838,7 +1128,8 @@ def render_answer(summary, matches, metadata_, page_texts_, msg_idx):
 
     for rank, m in enumerate(matches, start=1):
         title = display_name(m["source"], metadata_)
-        icon = "📄" if get_file_type(m["source"], metadata_) == "pdf" else "📝"
+        file_icons = {"pdf": "📄", "docx": "📝", "xlsx": "📊", "csv": "📊"}
+        icon = file_icons.get(get_file_type(m["source"], metadata_), "📄")
         badge = relevance_badge(m["score"])
         heading = "✅ Best match" if rank == 1 else f"Match {rank}"
 
@@ -858,7 +1149,13 @@ def render_answer(summary, matches, metadata_, page_texts_, msg_idx):
             full_text = page_texts_.get(m["source"], {}).get(m["location"], m["full_text"])
             loc_label = "page" if m["location"].startswith("Page") else "section"
             with st.expander(f"🔍 View full {loc_label} (ref #{msg_idx}.{rank})"):
-                st.caption(f"Raw relevance score: {m['score']}")
+                if m.get("semantic_score") is not None:
+                    st.caption(
+                        f"Hybrid score: {m['score']} "
+                        f"(lexical: {m['tfidf_score']}, semantic: {m['semantic_score']})"
+                    )
+                else:
+                    st.caption(f"Raw relevance score: {m['score']}")
                 st.write(full_text)
 
 
@@ -885,7 +1182,7 @@ if question:
             st.session_state.messages.append({"role": "assistant", "type": "text", "content": generic_reply})
             log_interaction(question, generic_reply, [], metadata, st.session_state.username)
         else:
-            matches = get_top_matches(chunks, question)
+            matches = get_top_matches(chunks, question, chunk_embeddings)
             if not matches:
                 reply = "Sorry, I couldn't find anything relevant to that in the document(s)."
                 st.markdown(reply)
